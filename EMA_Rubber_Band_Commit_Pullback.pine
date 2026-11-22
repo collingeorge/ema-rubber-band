@@ -1,0 +1,404 @@
+//@version=6
+indicator("200 EMA Rubber Band: Range, Commit & First Pullback", shorttitle = "EMA Rubber Band", overlay = true, max_bars_back = 2000)
+
+// =============================================================================
+// 200 EMA Rubber Band: Range, Commit & First Pullback  (v3)
+// -----------------------------------------------------------------------------
+// Models this behavior (gold, Nasdaq, oil, Nikkei; 5m for scalps, 1H for swings):
+//
+//   1. RANGE      Price swings above and below a flat 200 EMA and snaps back.
+//                 "Normal stretch" = how far price usually gets from the EMA,
+//                 measured from the asset's own recent history (a percentile
+//                 of its distance from the EMA). No ATR.
+//                 Reaching the normal stretch = rubber-band extreme (SNAP).
+//
+//   2. COMMIT     After a range, price closes FARTHER than normal from the
+//                 EMA (default 1.5x the normal stretch). That is the move
+//                 that starts a new direction.
+//
+//   3. FIRST PB   Price pulls back to the EMA (touches near it, or dips
+//                 through it by a limited amount) without failing. That
+//                 first pullback is the entry zone. SNI times the entry.
+//
+//   4. TREND      Direction holds until price starts crossing the EMA again
+//                 (back to RANGE) or commits hard the other way (REVERSAL).
+//
+// Higher-timeframe bias (15m/1H/4H or 4H/1D/1W) is shown on the dashboard
+// and can optionally block fades or commits against the highest timeframe.
+//
+// Non-repainting: HTF values come from closed HTF bars; the state machine
+// only keeps changes made on closed chart bars. Set alerts to
+// "Once Per Bar Close".
+// =============================================================================
+
+// ---------------- Inputs: mode and higher timeframes ----------------
+grpMode  = "Mode and higher timeframes"
+modeIn   = input.string("Auto (Chart TF)", "Trading mode", options = ["Auto (Chart TF)", "Intraday Scalp", "Swing Hold"], group = grpMode, tooltip = "Auto: charts of 15m or lower use Intraday Scalp; charts above 15m use Swing Hold.")
+scalpTF1 = input.timeframe("15",  "Scalp HTF 1", group = grpMode)
+scalpTF2 = input.timeframe("60",  "Scalp HTF 2", group = grpMode)
+scalpTF3 = input.timeframe("240", "Scalp HTF 3 (highest)", group = grpMode)
+swingTF1 = input.timeframe("240", "Swing HTF 1", group = grpMode)
+swingTF2 = input.timeframe("D",   "Swing HTF 2", group = grpMode)
+swingTF3 = input.timeframe("W",   "Swing HTF 3 (highest)", group = grpMode)
+
+// ---------------- Inputs: rubber band ----------------
+grpBand   = "200 EMA rubber band"
+emaLen    = input.int(200, "EMA length", minval = 2, group = grpBand)
+devPct    = input.float(90.0, "Normal stretch = this percentile of distance from EMA", minval = 50.0, maxval = 99.0, step = 1.0, group = grpBand, tooltip = "90 = price is within this distance of the EMA 90% of the time over the lookback. That distance is the normal stretch / rubber-band limit.")
+breakMult = input.float(1.5, "Commit = close beyond EMA by X times normal stretch", minval = 1.0, step = 0.05, group = grpBand, tooltip = "How much farther than normal price must close from the EMA to count as committing to a direction.")
+slopeLen  = input.int(24, "EMA slope lookback (chart bars)", minval = 2, group = grpBand)
+flatThr   = input.float(0.25, "EMA is flat if it moved less than X times normal stretch over the slope lookback", minval = 0.0, step = 0.05, group = grpBand)
+
+// ---------------- Inputs: lengths per mode ----------------
+grpScalp   = "Intraday Scalp lengths (bars)"
+scDevLen   = input.int(576, "Normal-stretch lookback", minval = 50, group = grpScalp, tooltip = "576 bars on 5m = 2 days.")
+scRangeWin = input.int(288, "Range check window", minval = 20, group = grpScalp, tooltip = "288 bars on 5m = 1 day.")
+scMaxWait  = input.int(288, "Max bars to wait for first pullback", minval = 5, group = grpScalp)
+
+grpSwing   = "Swing Hold lengths (bars)"
+swDevLen   = input.int(240, "Normal-stretch lookback", minval = 50, group = grpSwing, tooltip = "240 bars on 1H = about 10 trading days.")
+swRangeWin = input.int(120, "Range check window", minval = 20, group = grpSwing, tooltip = "120 bars on 1H = about 5 trading days.")
+swMaxWait  = input.int(120, "Max bars to wait for first pullback", minval = 5, group = grpSwing)
+
+// ---------------- Inputs: range and pullback rules ----------------
+grpRules   = "Range and pullback rules"
+minCrosses = input.int(3, "Ranging = at least N EMA crosses in the range window", minval = 1, group = grpRules)
+pbTol      = input.float(0.5, "First pullback: low/high comes within X times normal stretch of EMA", minval = 0.0, step = 0.05, group = grpRules)
+maxUnder   = input.float(1.0, "First pullback may close through EMA by up to X times normal stretch", minval = 0.0, step = 0.05, group = grpRules, tooltip = "A close farther through the EMA than this = commit failed, back to range.")
+laterPB    = input.bool(false, "Also mark later pullbacks while the trend holds", group = grpRules)
+
+// ---------------- Inputs: higher-timeframe filter ----------------
+grpHTF       = "Higher-timeframe filter"
+htfSlopeLen  = input.int(10, "HTF EMA slope lookback (HTF bars)", minval = 1, group = grpHTF)
+needSide     = input.bool(true, "HTF bias also requires close on the same side of its EMA", group = grpHTF)
+blockFades   = input.bool(true, "Block range fades against the highest HTF", group = grpHTF)
+commitWithTop = input.bool(false, "Only accept commits in the highest HTF direction", group = grpHTF, tooltip = "Off by default: a commit against the highest HTF can be the start of a larger trend change.")
+
+// ---------------- Inputs: alerts and visuals ----------------
+grpVis      = "Alerts and visuals"
+confirmOnly = input.bool(true, "Signals/alerts on confirmed bars only", group = grpVis)
+cooldown    = input.int(12, "Snap alert cooldown (bars)", minval = 1, group = grpVis)
+showBands   = input.bool(true, "Show normal-stretch bands", group = grpVis)
+showCommit  = input.bool(true, "Show commit lines", group = grpVis)
+showFill    = input.bool(true, "Shade the band while ranging", group = grpVis)
+showBg      = input.bool(true, "Background while waiting for first pullback", group = grpVis)
+showMarks   = input.bool(true, "Signal markers", group = grpVis)
+showBlocked = input.bool(true, "Mark blocked snaps (against highest HTF)", group = grpVis)
+showHud     = input.bool(true, "Show dashboard", group = grpVis)
+hudPosIn    = input.string("Top right", "Dashboard position", options = ["Top right", "Top left", "Bottom right", "Bottom left"], group = grpVis)
+hudSizeIn   = input.string("Small", "Dashboard text size", options = ["Tiny", "Small", "Normal"], group = grpVis)
+
+// ---------------- Mode resolution ----------------
+chartSec = timeframe.in_seconds()
+isAuto   = modeIn == "Auto (Chart TF)"
+isScalp  = modeIn == "Intraday Scalp" or (isAuto and chartSec <= 900)
+
+tf1      = isScalp ? scalpTF1 : swingTF1
+tf2      = isScalp ? scalpTF2 : swingTF2
+tf3      = isScalp ? scalpTF3 : swingTF3
+devLen   = isScalp ? scDevLen : swDevLen
+rangeWin = isScalp ? scRangeWin : swRangeWin
+maxWait  = isScalp ? scMaxWait : swMaxWait
+
+// ---------------- Functions ----------------
+// HTF bias inside request.security; returns the last CLOSED HTF bar ([1]).
+f_bias(int len, int slLen, bool reqSide) =>
+    float e       = ta.ema(close, len)
+    bool  rising  = not na(e[slLen]) and e > e[slLen]
+    bool  falling = not na(e[slLen]) and e < e[slLen]
+    bool  up      = rising and (not reqSide or close > e)
+    bool  dn      = falling and (not reqSide or close < e)
+    int   b       = up ? 1 : dn ? -1 : 0
+    [b[1], e[1]]
+
+f_tfLabel(string tf) =>
+    int s = timeframe.in_seconds(tf)
+    s < 3600 ? str.tostring(math.round(s / 60)) + "m" : s < 86400 ? str.tostring(math.round(s / 3600)) + "H" : s < 604800 ? str.tostring(math.round(s / 86400)) + "D" : s < 2419200 ? str.tostring(math.round(s / 604800)) + "W" : tf
+
+f_biasTxt(int b, bool tfOk, bool valid) =>
+    not tfOk ? "n/a (below chart TF)" : not valid ? "warming up" : b == 1 ? "BULLISH ▲" : b == -1 ? "BEARISH ▼" : "FLAT"
+
+f_biasCol(int b, bool valid) =>
+    not valid ? color.gray : b == 1 ? color.lime : b == -1 ? color.red : color.yellow
+
+// Fires on a new condition, then stays quiet for cd bars (one instance per call site)
+f_gate(bool cond, int cd) =>
+    var int last = na
+    bool fire = cond and (na(last) or bar_index - last >= cd)
+    if fire
+        last := bar_index
+    fire
+
+// ---------------- Higher-timeframe bias (non-repainting) ----------------
+[b1r, e1] = request.security(syminfo.tickerid, tf1, f_bias(emaLen, htfSlopeLen, needSide), lookahead = barmerge.lookahead_on)
+[b2r, e2] = request.security(syminfo.tickerid, tf2, f_bias(emaLen, htfSlopeLen, needSide), lookahead = barmerge.lookahead_on)
+[b3r, e3] = request.security(syminfo.tickerid, tf3, f_bias(emaLen, htfSlopeLen, needSide), lookahead = barmerge.lookahead_on)
+
+ok1 = timeframe.in_seconds(tf1) >= chartSec
+ok2 = timeframe.in_seconds(tf2) >= chartSec
+ok3 = timeframe.in_seconds(tf3) >= chartSec
+
+v1 = ok1 and not na(e1) and not na(b1r)
+v2 = ok2 and not na(e2) and not na(b2r)
+v3 = ok3 and not na(e3) and not na(b3r)
+
+b1 = v1 ? b1r : 0
+b2 = v2 ? b2r : 0
+b3 = v3 ? b3r : 0
+
+topUp = v3 and b3 == 1
+topDn = v3 and b3 == -1
+
+// ---------------- Chart-timeframe rubber band ----------------
+ema200  = ta.ema(close, emaLen)
+absDev  = math.abs(close - ema200)
+normDev = ta.percentile_nearest_rank(absDev, devLen, devPct)[1]
+okData  = not na(ema200) and not na(normDev) and normDev > 0
+
+stretchNow = okData ? (close - ema200) / normDev : na
+
+slopeN     = okData and not na(ema200[slopeLen]) ? (ema200 - ema200[slopeLen]) / normDev : na
+slopeState = na(slopeN) ? 0 : slopeN > flatThr ? 1 : slopeN < -flatThr ? -1 : 0
+
+crossed    = ta.cross(close, ema200)
+crossCount = math.sum(crossed ? 1 : 0, rangeWin)
+wasRanging = nz(crossCount[1]) >= minCrosses
+
+// ---------------- State machine ----------------
+//  0 = range    1 = committed up, waiting for 1st pullback    2 = trend up
+//                -1 = committed down, waiting for 1st pullback  -2 = trend down
+var int   state      = 0
+var float cDev       = na
+var int   cBar       = na
+var int   crossSince = 0
+
+bool commitUp   = false
+bool commitDn   = false
+bool pbLong     = false
+bool pbShort    = false
+bool failed     = false
+bool toRange    = false
+bool laterLong  = false
+bool laterShort = false
+bool reversal   = false
+
+upOK = not commitWithTop or topUp
+dnOK = not commitWithTop or topDn
+
+if okData
+    if crossed
+        crossSince += 1
+
+    if state == 0
+        if wasRanging and close > ema200 + breakMult * normDev and upOK
+            state      := 1
+            cDev       := normDev
+            cBar       := bar_index
+            crossSince := 0
+            commitUp   := true
+        else if wasRanging and close < ema200 - breakMult * normDev and dnOK
+            state      := -1
+            cDev       := normDev
+            cBar       := bar_index
+            crossSince := 0
+            commitDn   := true
+
+    else if state == 1
+        if close < ema200 - maxUnder * cDev
+            state  := 0
+            failed := true
+        else if low <= ema200 + pbTol * cDev
+            state  := 2
+            pbLong := true
+        else if bar_index - cBar > maxWait
+            state := 2
+
+    else if state == -1
+        if close > ema200 + maxUnder * cDev
+            state  := 0
+            failed := true
+        else if high >= ema200 - pbTol * cDev
+            state   := -2
+            pbShort := true
+        else if bar_index - cBar > maxWait
+            state := -2
+
+    else if state == 2
+        if close < ema200 - breakMult * normDev and dnOK
+            state      := -1
+            cDev       := normDev
+            cBar       := bar_index
+            crossSince := 0
+            commitDn   := true
+            reversal   := true
+        else if crossSince >= minCrosses
+            state   := 0
+            toRange := true
+        else if laterPB and low <= ema200 + pbTol * cDev and close >= ema200 - maxUnder * cDev and not (low[1] <= ema200[1] + pbTol * cDev)
+            laterLong := true
+
+    else if state == -2
+        if close > ema200 + breakMult * normDev and upOK
+            state      := 1
+            cDev       := normDev
+            cBar       := bar_index
+            crossSince := 0
+            commitUp   := true
+            reversal   := true
+        else if crossSince >= minCrosses
+            state   := 0
+            toRange := true
+        else if laterPB and high >= ema200 - pbTol * cDev and close <= ema200 + maxUnder * cDev and not (high[1] >= ema200[1] - pbTol * cDev)
+            laterShort := true
+
+// ---------------- Range snaps (rubber-band extremes) ----------------
+inRange   = okData and state == 0 and wasRanging
+snapUp    = inRange and high >= ema200 + normDev and close <= ema200 + breakMult * normDev and not commitUp
+snapDn    = inRange and low <= ema200 - normDev and close >= ema200 - breakMult * normDev and not commitDn
+snapUpOK  = snapUp and not (blockFades and topUp)
+snapDnOK  = snapDn and not (blockFades and topDn)
+snapUpBlk = snapUp and blockFades and topUp
+snapDnBlk = snapDn and blockFades and topDn
+
+// ---------------- Signal events ----------------
+confirmOK = not confirmOnly or barstate.isconfirmed
+
+commitUpSig   = commitUp and confirmOK
+commitDnSig   = commitDn and confirmOK
+pbLongSig     = pbLong and confirmOK
+pbShortSig    = pbShort and confirmOK
+failedSig     = failed and confirmOK
+toRangeSig    = toRange and confirmOK
+laterLongSig  = laterLong and confirmOK
+laterShortSig = laterShort and confirmOK
+snapShortSig  = f_gate(snapUpOK and not snapUp[1] and confirmOK, cooldown)
+snapLongSig   = f_gate(snapDnOK and not snapDn[1] and confirmOK, cooldown)
+snapUpBlkSig  = snapUpBlk and not snapUp[1] and confirmOK
+snapDnBlkSig  = snapDnBlk and not snapDn[1] and confirmOK
+
+// ---------------- Verdict ----------------
+topLbl  = f_tfLabel(tf3)
+waitBar = na(cBar) ? 0 : bar_index - cBar
+
+string verdict = "Wait"
+color  vCol    = color.gray
+
+if not okData
+    verdict := "Warming up"
+else if pbLong
+    verdict := "FIRST PULLBACK LONG - check SNI"
+    vCol    := color.lime
+else if pbShort
+    verdict := "FIRST PULLBACK SHORT - check SNI"
+    vCol    := color.red
+else if commitUp
+    verdict := (reversal ? "REVERSAL " : "") + "COMMIT UP - wait for first pullback"
+    vCol    := color.green
+else if commitDn
+    verdict := (reversal ? "REVERSAL " : "") + "COMMIT DOWN - wait for first pullback"
+    vCol    := color.maroon
+else if failed
+    verdict := "Commit failed - back to range"
+    vCol    := color.orange
+else if state == 1
+    verdict := "Committed up - waiting for first pullback (" + str.tostring(waitBar) + " bars)"
+    vCol    := color.green
+else if state == -1
+    verdict := "Committed down - waiting for first pullback (" + str.tostring(waitBar) + " bars)"
+    vCol    := color.maroon
+else if state == 2
+    verdict := laterLong ? "Trend long - later pullback" : "Trend up - no new entry, manage position"
+    vCol    := color.teal
+else if state == -2
+    verdict := laterShort ? "Trend short - later pullback" : "Trend down - no new entry, manage position"
+    vCol    := color.orange
+else if snapUpOK
+    verdict := "RANGE SNAP SHORT - stretched above EMA"
+    vCol    := color.fuchsia
+else if snapDnOK
+    verdict := "RANGE SNAP LONG - stretched below EMA"
+    vCol    := color.aqua
+else if snapUpBlk
+    verdict := "Stretched above EMA - short BLOCKED (" + topLbl + " up)"
+else if snapDnBlk
+    verdict := "Stretched below EMA - long BLOCKED (" + topLbl + " down)"
+else if wasRanging
+    verdict := "Ranging around EMA - inside band, no trade"
+    vCol    := color.yellow
+else
+    verdict := "No range, no commit - wait"
+
+stateTxt = not okData ? "warming up" : state == 1 ? "COMMITTED UP - awaiting 1st pullback" : state == -1 ? "COMMITTED DOWN - awaiting 1st pullback" : state == 2 ? "TREND UP" : state == -2 ? "TREND DOWN" : wasRanging ? "RANGE (rubber band)" : "NO RANGE (too few EMA crosses)"
+
+// ---------------- Plots ----------------
+emaCol = state == 2 ? color.lime : state == 1 ? color.green : state == -2 ? color.red : state == -1 ? color.maroon : wasRanging ? color.yellow : color.gray
+plot(ema200, "200 EMA", color = emaCol, linewidth = 2)
+
+pNU = plot(showBands and okData ? ema200 + normDev : na, "Normal stretch (upper)", color = color.new(color.orange, 20))
+pND = plot(showBands and okData ? ema200 - normDev : na, "Normal stretch (lower)", color = color.new(color.orange, 20))
+plot(showCommit and okData ? ema200 + breakMult * normDev : na, "Commit line (upper)", color = color.new(color.gray, 20), style = plot.style_circles, linewidth = 1)
+plot(showCommit and okData ? ema200 - breakMult * normDev : na, "Commit line (lower)", color = color.new(color.gray, 20), style = plot.style_circles, linewidth = 1)
+fill(pNU, pND, color = showFill and state == 0 and wasRanging ? color.new(color.yellow, 93) : color(na), title = "Range band shade")
+
+bgcolor(showBg and state == 1 ? color.new(color.green, 92) : showBg and state == -1 ? color.new(color.red, 92) : color(na), title = "Waiting for first pullback")
+
+plotshape(showMarks and commitUpSig,   "Commit up",             shape.labelup,      location.belowbar, color.green,   size = size.small, text = "COMMIT", textcolor = color.white)
+plotshape(showMarks and commitDnSig,   "Commit down",           shape.labeldown,    location.abovebar, color.maroon,  size = size.small, text = "COMMIT", textcolor = color.white)
+plotshape(showMarks and pbLongSig,     "First pullback long",   shape.triangleup,   location.belowbar, color.lime,    size = size.normal, text = "PB1", textcolor = color.lime)
+plotshape(showMarks and pbShortSig,    "First pullback short",  shape.triangledown, location.abovebar, color.red,     size = size.normal, text = "PB1", textcolor = color.red)
+plotshape(showMarks and laterLongSig,  "Later pullback long",   shape.triangleup,   location.belowbar, color.new(color.lime, 40), size = size.tiny, text = "PB", textcolor = color.new(color.lime, 40))
+plotshape(showMarks and laterShortSig, "Later pullback short",  shape.triangledown, location.abovebar, color.new(color.red, 40),  size = size.tiny, text = "PB", textcolor = color.new(color.red, 40))
+plotshape(showMarks and snapShortSig,  "Range snap short",      shape.circle,       location.abovebar, color.fuchsia, size = size.tiny, text = "SNAP", textcolor = color.fuchsia)
+plotshape(showMarks and snapLongSig,   "Range snap long",       shape.circle,       location.belowbar, color.aqua,    size = size.tiny, text = "SNAP", textcolor = color.aqua)
+plotshape(showMarks and failedSig,     "Commit failed",         shape.xcross,       location.abovebar, color.orange,  size = size.small, text = "FAIL", textcolor = color.orange)
+plotshape(showMarks and toRangeSig,    "Back to range",         shape.square,       location.abovebar, color.yellow,  size = size.tiny, text = "RANGE", textcolor = color.yellow)
+plotshape(showMarks and showBlocked and snapUpBlkSig, "Snap short blocked", shape.xcross, location.abovebar, color.gray, size = size.tiny)
+plotshape(showMarks and showBlocked and snapDnBlkSig, "Snap long blocked",  shape.xcross, location.belowbar, color.gray, size = size.tiny)
+
+// ---------------- Dashboard ----------------
+hudPos  = hudPosIn == "Top right" ? position.top_right : hudPosIn == "Top left" ? position.top_left : hudPosIn == "Bottom right" ? position.bottom_right : position.bottom_left
+hudSize = hudSizeIn == "Tiny" ? size.tiny : hudSizeIn == "Small" ? size.small : size.normal
+
+var table hud = table.new(hudPos, 2, 10, bgcolor = color.new(color.black, 20), border_color = color.new(color.gray, 60), border_width = 1)
+
+f_cell(int c, int r, string txt, color tc) =>
+    table.cell(hud, c, r, txt, text_color = tc, text_size = hudSize, text_halign = text.align_left)
+
+if showHud and barstate.islast
+    modeTxt   = (isScalp ? "Intraday Scalp" : "Swing Hold") + (isAuto ? " (auto)" : "")
+    slopeTxt  = na(slopeN) ? "n/a" : (slopeState == 1 ? "RISING" : slopeState == -1 ? "FALLING" : "FLAT") + "  (" + str.tostring(slopeN, "0.00") + "x over " + str.tostring(slopeLen) + " bars)"
+    slopeCol  = slopeState == 1 ? color.lime : slopeState == -1 ? color.red : color.yellow
+    crossTxt  = str.tostring(nz(crossCount)) + " in last " + str.tostring(rangeWin) + " bars" + (wasRanging ? "  -> ranging" : "")
+    strTxt    = na(stretchNow) ? "n/a" : (stretchNow >= 0 ? "+" : "") + str.tostring(stretchNow, "0.00") + "x normal  (normal = " + str.tostring(normDev, format.mintick) + ")"
+    strCol    = na(stretchNow) ? color.gray : math.abs(stretchNow) >= breakMult ? color.fuchsia : math.abs(stretchNow) >= 1.0 ? color.orange : color.white
+
+    f_cell(0, 0, "EMA RUBBER BAND", color.white)
+    f_cell(1, 0, syminfo.ticker + "  " + f_tfLabel(timeframe.period), color.white)
+    f_cell(0, 1, "Mode", color.silver)
+    f_cell(1, 1, modeTxt, color.white)
+    f_cell(0, 2, f_tfLabel(tf1) + " bias", color.silver)
+    f_cell(1, 2, f_biasTxt(b1, ok1, v1), f_biasCol(b1, v1))
+    f_cell(0, 3, f_tfLabel(tf2) + " bias", color.silver)
+    f_cell(1, 3, f_biasTxt(b2, ok2, v2), f_biasCol(b2, v2))
+    f_cell(0, 4, f_tfLabel(tf3) + " bias (highest)", color.silver)
+    f_cell(1, 4, f_biasTxt(b3, ok3, v3), f_biasCol(b3, v3))
+    f_cell(0, 5, "200 EMA slope", color.silver)
+    f_cell(1, 5, slopeTxt, slopeCol)
+    f_cell(0, 6, "EMA crosses", color.silver)
+    f_cell(1, 6, crossTxt, wasRanging ? color.yellow : color.white)
+    f_cell(0, 7, "Stretch now", color.silver)
+    f_cell(1, 7, strTxt, strCol)
+    f_cell(0, 8, "State", color.silver)
+    f_cell(1, 8, stateTxt, emaCol)
+    f_cell(0, 9, "ALLOWED PLAY", color.white)
+    f_cell(1, 9, verdict, vCol)
+
+// ---------------- Alerts (set to "Once Per Bar Close") ----------------
+alertcondition(commitUpSig,  "Commit up",            "EMA Rubber Band: COMMIT UP on {{ticker}} ({{interval}}) - wait for first pullback to the 200 EMA.")
+alertcondition(commitDnSig,  "Commit down",          "EMA Rubber Band: COMMIT DOWN on {{ticker}} ({{interval}}) - wait for first pullback to the 200 EMA.")
+alertcondition(pbLongSig,    "First pullback long",  "EMA Rubber Band: FIRST PULLBACK LONG at the 200 EMA on {{ticker}} ({{interval}}). Check SNI.")
+alertcondition(pbShortSig,   "First pullback short", "EMA Rubber Band: FIRST PULLBACK SHORT at the 200 EMA on {{ticker}} ({{interval}}). Check SNI.")
+alertcondition(snapShortSig, "Range snap short",     "EMA Rubber Band: price stretched ABOVE the 200 EMA in a range on {{ticker}} ({{interval}}). Check SNI/RSI for the snap back.")
+alertcondition(snapLongSig,  "Range snap long",      "EMA Rubber Band: price stretched BELOW the 200 EMA in a range on {{ticker}} ({{interval}}). Check SNI/RSI for the snap back.")
+alertcondition(failedSig,    "Commit failed",        "EMA Rubber Band: commit FAILED on {{ticker}} ({{interval}}) - back to range.")
+alertcondition(toRangeSig,   "Back to range",        "EMA Rubber Band: trend ended, price ranging around the 200 EMA again on {{ticker}} ({{interval}}).")
