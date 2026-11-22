@@ -83,6 +83,7 @@ sniUse     = input.bool(false, "Confirm with SNI turn", group = grpTP, tooltip =
 sniSrc     = input.source(close, "SNI line (pick from the SNI indicator)", group = grpTP)
 sniLevel   = input.float(50.0, "SNI overbought level (oversold = minus this)", step = 1.0, group = grpTP)
 sniWin     = input.int(3, "SNI turn may come up to N bars before the zone", minval = 0, group = grpTP)
+tpNeedDot  = input.bool(true, "TPB also needs the SMI dot (no dot = no mark)", group = grpTP, tooltip = "Uses the SMI dot plots picked under 'SNI dot + EMA slope'. The dot may come up to N bars (setting above) before the pullback.")
 showTpZone = input.bool(true, "Show pullback zone line", group = grpTP)
 
 // ---------------- Inputs: SNI dot + EMA slope (v4) ----------------
@@ -281,6 +282,17 @@ if okData
         else if laterPB and high >= ema200 - pbTol * cDev and close <= ema200 + maxUnder * cDev and not (high[1] >= ema200[1] - pbTol * cDev)
             laterShort := true
 
+// ---------------- SMI dots (read from the SMI indicator) ----------------
+// A dot counts on the bar where the chosen SMI output turns on (non-zero, not na).
+f_dotOn(float src) =>
+    bool on = not na(src) and src != 0 and src != close
+    on and not (not na(src[1]) and src[1] != 0 and src[1] != close[1])
+
+bool dnDotRaw    = f_dotOn(ssDnSrc)
+bool upDotRaw    = f_dotOn(ssUpSrc)
+bool dotRecentDn = nz(ta.barssince(dnDotRaw), 100000) <= sniWin
+bool dotRecentUp = nz(ta.barssince(upDotRaw), 100000) <= sniWin
+
 // ---------------- Trend pullback without a prior range (v4) ----------------
 float sniPrev   = sniSrc[1]
 bool  sniTurnDn = sniUse and not na(sniPrev) and sniPrev >= sniLevel and sniSrc < sniPrev
@@ -318,7 +330,7 @@ if okData
             armDn := true
         if armDn and not zoneDn and high >= ema200 - tpZone * normDev
             zoneDn := true
-        if zoneDn and sniOkDn
+        if zoneDn and sniOkDn and (not tpNeedDot or dotRecentDn)
             tpbShort := true
             zoneDn   := false
             armDn    := false
@@ -333,27 +345,28 @@ if okData
             armUp := true
         if armUp and not zoneUp and low <= ema200 + tpZone * normDev
             zoneUp := true
-        if zoneUp and sniOkUp
+        if zoneUp and sniOkUp and (not tpNeedDot or dotRecentUp)
             tpbLong := true
             zoneUp  := false
             armUp   := false
 
 // ---------------- SNI dot + EMA slope (v4) ----------------
-// A dot counts on the bar where the chosen SNI output turns on (non-zero, not na).
-f_dotOn(float src) =>
-    bool on = not na(src) and src != 0 and src != close
-    on and not (not na(src[1]) and src[1] != 0 and src[1] != close[1])
-
-bool dnDotRaw = f_dotOn(ssDnSrc)
-bool upDotRaw = f_dotOn(ssUpSrc)
 bool ssDnDot  = ssEnable and dnDotRaw
 bool ssUpDot  = ssEnable and upDotRaw
 // Ranging regime: shaded range (enough EMA crosses) or EMA flatter than the slope threshold
 bool crossedRecent = nz(ta.barssince(crossed), 100000) < ssNoCross
 bool rangingRegime = okData and (wasRanging or na(slopeN) or math.abs(slopeN) < ssSlope or crossedRecent)
 
-bool ssShort  = okData and ssDnDot and not rangingRegime and slopeN <= -ssSlope and (not ssBelow or close < ema200)
-bool ssLong   = okData and ssUpDot and not rangingRegime and slopeN >= ssSlope  and (not ssBelow or close > ema200)
+// Trend: the pullback must reach the red/green zone line (tpZone x normal from the EMA)
+bool zoneTouchDn = okData and high >= ema200 - tpZone * normDev
+bool zoneTouchUp = okData and low <= ema200 + tpZone * normDev
+bool nearZoneDn  = nz(ta.barssince(zoneTouchDn), 100000) <= rsWin
+bool nearZoneUp  = nz(ta.barssince(zoneTouchUp), 100000) <= rsWin
+bool trendDnReg  = okData and not rangingRegime and slopeN <= -ssSlope
+bool trendUpReg  = okData and not rangingRegime and slopeN >= ssSlope
+
+bool ssShort  = trendDnReg and ssDnDot and nearZoneDn and (not ssBelow or close < ema200)
+bool ssLong   = trendUpReg and ssUpDot and nearZoneUp and (not ssBelow or close > ema200)
 
 // Ranging: SMI dot only counts at a band touch (SNAP zone)
 bool touchUp  = okData and high >= ema200 + normDev
@@ -488,8 +501,8 @@ plot(showCommit and okData ? ema200 + breakMult * normDev : na, "Commit line (up
 plot(showCommit and okData ? ema200 - breakMult * normDev : na, "Commit line (lower)", color = color.new(color.gray, 20), style = plot.style_circles, linewidth = 1)
 fill(pNU, pND, color = showFill and state == 0 and wasRanging ? color.new(color.yellow, 93) : color(na), title = "Range band shade")
 
-plot(showTpZone and (armDn or zoneDn) ? ema200 - tpZone * normDev : na, "Trend pullback zone (short)", color = color.new(color.red, 30), style = plot.style_linebr, linewidth = 2)
-plot(showTpZone and (armUp or zoneUp) ? ema200 + tpZone * normDev : na, "Trend pullback zone (long)", color = color.new(color.lime, 30), style = plot.style_linebr, linewidth = 2)
+plot(showTpZone and (armDn or zoneDn or trendDnReg) ? ema200 - tpZone * normDev : na, "Trend pullback zone (short)", color = color.new(color.red, 30), style = plot.style_linebr, linewidth = 2)
+plot(showTpZone and (armUp or zoneUp or trendUpReg) ? ema200 + tpZone * normDev : na, "Trend pullback zone (long)", color = color.new(color.lime, 30), style = plot.style_linebr, linewidth = 2)
 
 bgcolor(showBg and state == 1 ? color.new(color.green, 92) : showBg and state == -1 ? color.new(color.red, 92) : color(na), title = "Waiting for first pullback")
 
@@ -503,8 +516,8 @@ plotshape(showMarks and ssShortSig,    "SNI dot + slope short", shape.circle,   
 plotshape(showMarks and ssLongSig,     "SNI dot + slope long",  shape.circle,       location.belowbar, color.lime,    size = size.small, text = "SNI▲", textcolor = color.lime)
 plotshape(showMarks and rsShortSig,    "Range dot short",       shape.circle,       location.abovebar, color.fuchsia, size = size.small, text = "RNG▼", textcolor = color.fuchsia)
 plotshape(showMarks and rsLongSig,     "Range dot long",        shape.circle,       location.belowbar, color.aqua,    size = size.small, text = "RNG▲", textcolor = color.aqua)
-plotshape(showMarks and tpbShortSig,   "Trend pullback short",  shape.triangledown, location.abovebar, color.red,     size = size.normal, text = "TPB", textcolor = color.red)
-plotshape(showMarks and tpbLongSig,    "Trend pullback long",   shape.triangleup,   location.belowbar, color.lime,    size = size.normal, text = "TPB", textcolor = color.lime)
+plotshape(showMarks and tpbShortSig and not ssShortSig, "Trend pullback short",  shape.triangledown, location.abovebar, color.red,     size = size.normal, text = "TPB", textcolor = color.red)
+plotshape(showMarks and tpbLongSig and not ssLongSig, "Trend pullback long",   shape.triangleup,   location.belowbar, color.lime,    size = size.normal, text = "TPB", textcolor = color.lime)
 plotshape(showMarks and snapShortSig,  "Range snap short",      shape.circle,       location.abovebar, color.fuchsia, size = size.tiny, text = "SNAP", textcolor = color.fuchsia)
 plotshape(showMarks and snapLongSig,   "Range snap long",       shape.circle,       location.belowbar, color.aqua,    size = size.tiny, text = "SNAP", textcolor = color.aqua)
 plotshape(showMarks and failedSig,     "Commit failed",         shape.xcross,       location.abovebar, color.orange,  size = size.small, text = "FAIL", textcolor = color.orange)
