@@ -58,11 +58,13 @@ flatThr   = input.float(0.25, "EMA is flat if it moved less than X times normal 
 grpScalp   = "Intraday Scalp lengths (bars)"
 scDevLen   = input.int(576, "Normal-stretch lookback", minval = 50, group = grpScalp, tooltip = "576 bars on 5m = 2 days.")
 scRangeWin = input.int(288, "Range check window", minval = 20, group = grpScalp, tooltip = "288 bars on 5m = 1 day.")
+scSmiWin   = input.int(96, "Ranging check for SMI marks (bars)", minval = 10, group = grpScalp, tooltip = "EMA crosses counted over this many bars to call the market ranging for SNI/RNG marks. 96 bars on 5m = 8 hours.")
 scMaxWait  = input.int(288, "Max bars to wait for first pullback", minval = 5, group = grpScalp)
 
 grpSwing   = "Swing Hold lengths (bars)"
 swDevLen   = input.int(240, "Normal-stretch lookback", minval = 50, group = grpSwing, tooltip = "240 bars on 1H = about 10 trading days.")
 swRangeWin = input.int(120, "Range check window", minval = 20, group = grpSwing, tooltip = "120 bars on 1H = about 5 trading days.")
+swSmiWin   = input.int(120, "Ranging check for SMI marks (bars)", minval = 10, group = grpSwing, tooltip = "EMA crosses counted over this many bars to call the market ranging for SNI/RNG marks.")
 swMaxWait  = input.int(120, "Max bars to wait for first pullback", minval = 5, group = grpSwing)
 
 // ---------------- Inputs: range and pullback rules ----------------
@@ -129,6 +131,7 @@ tf2      = isScalp ? scalpTF2 : swingTF2
 tf3      = isScalp ? scalpTF3 : swingTF3
 devLen   = isScalp ? scDevLen : swDevLen
 rangeWin = isScalp ? scRangeWin : swRangeWin
+smiWin   = isScalp ? scSmiWin : swSmiWin
 maxWait  = isScalp ? scMaxWait : swMaxWait
 
 // ---------------- Functions ----------------
@@ -355,7 +358,9 @@ bool ssDnDot  = ssEnable and dnDotRaw
 bool ssUpDot  = ssEnable and upDotRaw
 // Ranging regime: shaded range (enough EMA crosses) or EMA flatter than the slope threshold
 bool crossedRecent = nz(ta.barssince(crossed), 100000) < ssNoCross
-bool rangingRegime = okData and (wasRanging or na(slopeN) or math.abs(slopeN) < ssSlope or crossedRecent)
+float smiCrosses = math.sum(crossed ? 1 : 0, smiWin)
+bool smiRanging    = nz(smiCrosses[1]) >= minCrosses
+bool rangingRegime = okData and (smiRanging or na(slopeN) or math.abs(slopeN) < ssSlope or crossedRecent)
 
 // Trend: the pullback must reach the red/green zone line (tpZone x normal from the EMA)
 bool zoneTouchDn = okData and high >= ema200 - tpZone * normDev
@@ -373,8 +378,9 @@ bool touchUp  = okData and high >= ema200 + normDev
 bool touchDn  = okData and low <= ema200 - normDev
 bool nearTop  = nz(ta.barssince(touchUp), 100000) <= rsWin
 bool nearBot  = nz(ta.barssince(touchDn), 100000) <= rsWin
-bool rsShort  = rsEnable and rangingRegime and state == 0 and ssDnDot and nearTop and not (rsBlock and blockFades and topUp)
-bool rsLong   = rsEnable and rangingRegime and state == 0 and ssUpDot and nearBot and not (rsBlock and blockFades and topDn)
+// Range fades never fight a steep EMA: no range short while it rises steeply, no range long while it falls steeply
+bool rsShort  = rsEnable and rangingRegime and state == 0 and ssDnDot and nearTop and not (slopeN >= ssSlope) and not (rsBlock and blockFades and topUp)
+bool rsLong   = rsEnable and rangingRegime and state == 0 and ssUpDot and nearBot and not (slopeN <= -ssSlope) and not (rsBlock and blockFades and topDn)
 
 // ---------------- Range snaps (rubber-band extremes) ----------------
 inRange   = okData and state == 0 and wasRanging
@@ -398,8 +404,8 @@ laterLongSig  = laterLong and confirmOK
 laterShortSig = laterShort and confirmOK
 snapShortSig  = f_gate(snapUpOK and not snapUp[1] and confirmOK, cooldown)
 snapLongSig   = f_gate(snapDnOK and not snapDn[1] and confirmOK, cooldown)
-ssShortSig    = ssShort and confirmOK
-ssLongSig     = ssLong and confirmOK
+ssShortSig    = f_gate(ssShort and confirmOK, cooldown)
+ssLongSig     = f_gate(ssLong and confirmOK, cooldown)
 rsShortSig    = f_gate(rsShort and confirmOK, cooldown)
 rsLongSig     = f_gate(rsLong and confirmOK, cooldown)
 tpbShortSig   = f_gate(tpbShort and confirmOK, cooldown)

@@ -14,7 +14,7 @@ A TradingView indicator (Pine Script v6) built around the 200 EMA. **Status: und
 | **RNG▼ / RNG▲** | (v5) Range: SMI red dot within 5 bars of a touch of the upper normal-stretch band (short), or green dot after a touch of the lower band (long). One per 12 bars. |
 | **FAIL / RANGE** | Commit failed / trend ended back in a range. |
 
-**Ranging vs trending (v5).** The market counts as ranging when any of these hold: the range is shaded (at least 3 EMA crosses in the range window), the EMA slope is flatter than X, or price crossed the EMA in the last 48 bars. Every short or long mark needs an SMI dot. In a trend the zone line (red below a falling EMA, green above a rising one) is drawn on the chart; a pullback that never reaches it does not count. While ranging, only RNG marks fire; SNI and TPB marks are off. While trending, SNI and TPB marks fire and RNG marks are off.
+**Ranging vs trending (v5).** For SMI marks the market counts as ranging when any of these hold: at least 3 EMA crosses in the last 96 bars on scalp charts (8 hours on 5m) or 120 bars on swing charts, the EMA slope is flatter than X, or price crossed the EMA in the last 48 bars. RNG fades are also blocked against a steep EMA (no RNG▲ while it falls steeply, no RNG▼ while it rises steeply). SNI marks have a 12-bar cooldown. Every short or long mark needs an SMI dot. In a trend the zone line (red below a falling EMA, green above a rising one) is drawn on the chart; a pullback that never reaches it does not count. While ranging, only RNG marks fire; SNI and TPB marks are off. While trending, SNI and TPB marks fire and RNG marks are off.
 
 "Normal stretch" is a percentile (default 90th) of the asset's own recent distance from the EMA. No ATR.
 
