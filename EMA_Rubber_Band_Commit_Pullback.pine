@@ -2,7 +2,7 @@
 indicator("200 EMA Rubber Band: Range, Commit & First Pullback", shorttitle = "EMA Rubber Band", overlay = true, max_bars_back = 2000)
 
 // =============================================================================
-// 200 EMA Rubber Band: Range, Commit & First Pullback  (v3)
+// 200 EMA Rubber Band: Range, Commit & First Pullback  (v4)
 // -----------------------------------------------------------------------------
 // Models this behavior (gold, Nasdaq, oil, Nikkei; 5m for scalps, 1H for swings):
 //
@@ -22,6 +22,11 @@ indicator("200 EMA Rubber Band: Range, Commit & First Pullback", shorttitle = "E
 //
 //   4. TREND      Direction holds until price starts crossing the EMA again
 //                 (back to RANGE) or commits hard the other way (REVERSAL).
+//
+//   5. TREND PB   (v4) No range needed. EMA sloping, highest HTF agrees,
+//                 price stretches beyond normal, then pulls back to within
+//                 a set distance of the EMA without touching it. Optional:
+//                 wait for SNI to turn from overbought/oversold (TPB).
 //
 // Higher-timeframe bias (15m/1H/4H or 4H/1D/1W) is shown on the dashboard
 // and can optionally block fades or commits against the highest timeframe.
@@ -66,6 +71,19 @@ minCrosses = input.int(3, "Ranging = at least N EMA crosses in the range window"
 pbTol      = input.float(0.5, "First pullback: low/high comes within X times normal stretch of EMA", minval = 0.0, step = 0.05, group = grpRules)
 maxUnder   = input.float(1.0, "First pullback may close through EMA by up to X times normal stretch", minval = 0.0, step = 0.05, group = grpRules, tooltip = "A close farther through the EMA than this = commit failed, back to range.")
 laterPB    = input.bool(false, "Also mark later pullbacks while the trend holds", group = grpRules)
+
+// ---------------- Inputs: trend pullback without a range (v4) ----------------
+grpTP      = "Trend pullback (no range needed)"
+tpEnable   = input.bool(true, "Detect trend pullbacks without a prior range", group = grpTP)
+tpHtfReq   = input.string("First two HTFs", "Trend needs these HTFs to agree", options = ["First two HTFs", "Highest HTF", "All three", "None"], group = grpTP, tooltip = "Swing mode: first two = 4H and 1D, highest = 1W. Scalp mode: first two = 15m and 1H, highest = 4H.")
+tpStretch  = input.float(1.0, "First, price must stretch beyond X times normal", minval = 0.1, step = 0.05, group = grpTP)
+tpZone     = input.float(0.75, "Pullback zone: price comes back within X times normal of EMA", minval = 0.0, step = 0.05, group = grpTP)
+tpThrough  = input.float(0.25, "Cancel if price closes through the EMA by more than X times normal", minval = 0.0, step = 0.05, group = grpTP)
+sniUse     = input.bool(false, "Confirm with SNI turn", group = grpTP, tooltip = "Pick the SNI line below. Short: SNI was at or above the level and turns down. Long: SNI was at or below minus the level and turns up.")
+sniSrc     = input.source(close, "SNI line (pick from the SNI indicator)", group = grpTP)
+sniLevel   = input.float(50.0, "SNI overbought level (oversold = minus this)", step = 1.0, group = grpTP)
+sniWin     = input.int(3, "SNI turn may come up to N bars before the zone", minval = 0, group = grpTP)
+showTpZone = input.bool(true, "Show pullback zone line", group = grpTP)
 
 // ---------------- Inputs: higher-timeframe filter ----------------
 grpHTF       = "Higher-timeframe filter"
@@ -251,6 +269,63 @@ if okData
         else if laterPB and high >= ema200 - pbTol * cDev and close <= ema200 + maxUnder * cDev and not (high[1] >= ema200[1] - pbTol * cDev)
             laterShort := true
 
+// ---------------- Trend pullback without a prior range (v4) ----------------
+float sniPrev   = sniSrc[1]
+bool  sniTurnDn = sniUse and not na(sniPrev) and sniPrev >= sniLevel and sniSrc < sniPrev
+bool  sniTurnUp = sniUse and not na(sniPrev) and sniPrev <= -sniLevel and sniSrc > sniPrev
+bool  sniOkDn   = not sniUse or nz(ta.barssince(sniTurnDn), 100000) <= sniWin
+bool  sniOkUp   = not sniUse or nz(ta.barssince(sniTurnUp), 100000) <= sniWin
+
+// Any fall/rise in the EMA counts here (the flat test above can call a strong trend
+// "flat" when the normal stretch is large); the highest HTF supplies the conviction.
+bool emaFalling  = not na(ema200[slopeLen]) and ema200 < ema200[slopeLen]
+bool emaRising   = not na(ema200[slopeLen]) and ema200 > ema200[slopeLen]
+bool twoDn      = v1 and b1 == -1 and v2 and b2 == -1
+bool twoUp      = v1 and b1 == 1 and v2 and b2 == 1
+bool htfDnOK    = tpHtfReq == "None" or (tpHtfReq == "First two HTFs" and twoDn) or (tpHtfReq == "Highest HTF" and topDn) or (tpHtfReq == "All three" and twoDn and topDn)
+bool htfUpOK    = tpHtfReq == "None" or (tpHtfReq == "First two HTFs" and twoUp) or (tpHtfReq == "Highest HTF" and topUp) or (tpHtfReq == "All three" and twoUp and topUp)
+bool tpDnAllowed = tpEnable and okData and emaFalling and htfDnOK and (state == 0 or state == -2)
+bool tpUpAllowed = tpEnable and okData and emaRising  and htfUpOK and (state == 0 or state == 2)
+
+var bool armDn  = false
+var bool zoneDn = false
+var bool armUp  = false
+var bool zoneUp = false
+bool tpbShort = false
+bool tpbLong  = false
+
+if okData
+    // Short side
+    if not tpDnAllowed or close > ema200 + tpThrough * normDev
+        armDn  := false
+        zoneDn := false
+    else
+        if zoneDn and close <= ema200 - tpStretch * normDev
+            zoneDn := false
+        if low <= ema200 - tpStretch * normDev
+            armDn := true
+        if armDn and not zoneDn and high >= ema200 - tpZone * normDev
+            zoneDn := true
+        if zoneDn and sniOkDn
+            tpbShort := true
+            zoneDn   := false
+            armDn    := false
+    // Long side
+    if not tpUpAllowed or close < ema200 - tpThrough * normDev
+        armUp  := false
+        zoneUp := false
+    else
+        if zoneUp and close >= ema200 + tpStretch * normDev
+            zoneUp := false
+        if high >= ema200 + tpStretch * normDev
+            armUp := true
+        if armUp and not zoneUp and low <= ema200 + tpZone * normDev
+            zoneUp := true
+        if zoneUp and sniOkUp
+            tpbLong := true
+            zoneUp  := false
+            armUp   := false
+
 // ---------------- Range snaps (rubber-band extremes) ----------------
 inRange   = okData and state == 0 and wasRanging
 snapUp    = inRange and high >= ema200 + normDev and close <= ema200 + breakMult * normDev and not commitUp
@@ -273,6 +348,8 @@ laterLongSig  = laterLong and confirmOK
 laterShortSig = laterShort and confirmOK
 snapShortSig  = f_gate(snapUpOK and not snapUp[1] and confirmOK, cooldown)
 snapLongSig   = f_gate(snapDnOK and not snapDn[1] and confirmOK, cooldown)
+tpbShortSig   = tpbShort and confirmOK
+tpbLongSig    = tpbLong and confirmOK
 snapUpBlkSig  = snapUpBlk and not snapUp[1] and confirmOK
 snapDnBlkSig  = snapDnBlk and not snapDn[1] and confirmOK
 
@@ -300,6 +377,18 @@ else if commitDn
 else if failed
     verdict := "Commit failed - back to range"
     vCol    := color.orange
+else if tpbShort
+    verdict := "TREND PULLBACK SHORT" + (sniUse ? " - SNI turned down" : " - check SNI")
+    vCol    := color.red
+else if tpbLong
+    verdict := "TREND PULLBACK LONG" + (sniUse ? " - SNI turned up" : " - check SNI")
+    vCol    := color.lime
+else if zoneDn
+    verdict := "Trend down, in pullback zone - wait for SNI to turn down"
+    vCol    := color.orange
+else if zoneUp
+    verdict := "Trend up, in pullback zone - wait for SNI to turn up"
+    vCol    := color.teal
 else if state == 1
     verdict := "Committed up - waiting for first pullback (" + str.tostring(waitBar) + " bars)"
     vCol    := color.green
@@ -322,13 +411,19 @@ else if snapUpBlk
     verdict := "Stretched above EMA - short BLOCKED (" + topLbl + " up)"
 else if snapDnBlk
     verdict := "Stretched below EMA - long BLOCKED (" + topLbl + " down)"
+else if tpDnAllowed and not wasRanging
+    verdict := armDn ? "Trend down - wait for pullback to within " + str.tostring(tpZone) + "x of EMA" : "Trend down - wait for a stretch beyond " + str.tostring(tpStretch) + "x, then a pullback"
+    vCol    := color.orange
+else if tpUpAllowed and not wasRanging
+    verdict := armUp ? "Trend up - wait for pullback to within " + str.tostring(tpZone) + "x of EMA" : "Trend up - wait for a stretch beyond " + str.tostring(tpStretch) + "x, then a pullback"
+    vCol    := color.teal
 else if wasRanging
     verdict := "Ranging around EMA - inside band, no trade"
     vCol    := color.yellow
 else
     verdict := "No range, no commit - wait"
 
-stateTxt = not okData ? "warming up" : state == 1 ? "COMMITTED UP - awaiting 1st pullback" : state == -1 ? "COMMITTED DOWN - awaiting 1st pullback" : state == 2 ? "TREND UP" : state == -2 ? "TREND DOWN" : wasRanging ? "RANGE (rubber band)" : "NO RANGE (too few EMA crosses)"
+stateTxt = not okData ? "warming up" : state == 1 ? "COMMITTED UP - awaiting 1st pullback" : state == -1 ? "COMMITTED DOWN - awaiting 1st pullback" : state == 2 ? "TREND UP" : state == -2 ? "TREND DOWN" : wasRanging ? "RANGE (rubber band)" : tpDnAllowed ? "TREND DOWN (no range)" + (zoneDn ? " - in pullback zone" : armDn ? " - stretched, awaiting pullback" : "") : tpUpAllowed ? "TREND UP (no range)" + (zoneUp ? " - in pullback zone" : armUp ? " - stretched, awaiting pullback" : "") : "NO RANGE (too few EMA crosses)"
 
 // ---------------- Plots ----------------
 emaCol = state == 2 ? color.lime : state == 1 ? color.green : state == -2 ? color.red : state == -1 ? color.maroon : wasRanging ? color.yellow : color.gray
@@ -340,6 +435,9 @@ plot(showCommit and okData ? ema200 + breakMult * normDev : na, "Commit line (up
 plot(showCommit and okData ? ema200 - breakMult * normDev : na, "Commit line (lower)", color = color.new(color.gray, 20), style = plot.style_circles, linewidth = 1)
 fill(pNU, pND, color = showFill and state == 0 and wasRanging ? color.new(color.yellow, 93) : color(na), title = "Range band shade")
 
+plot(showTpZone and (armDn or zoneDn) ? ema200 - tpZone * normDev : na, "Trend pullback zone (short)", color = color.new(color.red, 30), style = plot.style_linebr, linewidth = 2)
+plot(showTpZone and (armUp or zoneUp) ? ema200 + tpZone * normDev : na, "Trend pullback zone (long)", color = color.new(color.lime, 30), style = plot.style_linebr, linewidth = 2)
+
 bgcolor(showBg and state == 1 ? color.new(color.green, 92) : showBg and state == -1 ? color.new(color.red, 92) : color(na), title = "Waiting for first pullback")
 
 plotshape(showMarks and commitUpSig,   "Commit up",             shape.labelup,      location.belowbar, color.green,   size = size.small, text = "COMMIT", textcolor = color.white)
@@ -348,6 +446,8 @@ plotshape(showMarks and pbLongSig,     "First pullback long",   shape.triangleup
 plotshape(showMarks and pbShortSig,    "First pullback short",  shape.triangledown, location.abovebar, color.red,     size = size.normal, text = "PB1", textcolor = color.red)
 plotshape(showMarks and laterLongSig,  "Later pullback long",   shape.triangleup,   location.belowbar, color.new(color.lime, 40), size = size.tiny, text = "PB", textcolor = color.new(color.lime, 40))
 plotshape(showMarks and laterShortSig, "Later pullback short",  shape.triangledown, location.abovebar, color.new(color.red, 40),  size = size.tiny, text = "PB", textcolor = color.new(color.red, 40))
+plotshape(showMarks and tpbShortSig,   "Trend pullback short",  shape.triangledown, location.abovebar, color.red,     size = size.normal, text = "TPB", textcolor = color.red)
+plotshape(showMarks and tpbLongSig,    "Trend pullback long",   shape.triangleup,   location.belowbar, color.lime,    size = size.normal, text = "TPB", textcolor = color.lime)
 plotshape(showMarks and snapShortSig,  "Range snap short",      shape.circle,       location.abovebar, color.fuchsia, size = size.tiny, text = "SNAP", textcolor = color.fuchsia)
 plotshape(showMarks and snapLongSig,   "Range snap long",       shape.circle,       location.belowbar, color.aqua,    size = size.tiny, text = "SNAP", textcolor = color.aqua)
 plotshape(showMarks and failedSig,     "Commit failed",         shape.xcross,       location.abovebar, color.orange,  size = size.small, text = "FAIL", textcolor = color.orange)
@@ -398,6 +498,8 @@ alertcondition(commitUpSig,  "Commit up",            "EMA Rubber Band: COMMIT UP
 alertcondition(commitDnSig,  "Commit down",          "EMA Rubber Band: COMMIT DOWN on {{ticker}} ({{interval}}) - wait for first pullback to the 200 EMA.")
 alertcondition(pbLongSig,    "First pullback long",  "EMA Rubber Band: FIRST PULLBACK LONG at the 200 EMA on {{ticker}} ({{interval}}). Check SNI.")
 alertcondition(pbShortSig,   "First pullback short", "EMA Rubber Band: FIRST PULLBACK SHORT at the 200 EMA on {{ticker}} ({{interval}}). Check SNI.")
+alertcondition(tpbShortSig,  "Trend pullback short", "EMA Rubber Band: TREND PULLBACK SHORT on {{ticker}} ({{interval}}) - downtrend, pullback toward the 200 EMA.")
+alertcondition(tpbLongSig,   "Trend pullback long",  "EMA Rubber Band: TREND PULLBACK LONG on {{ticker}} ({{interval}}) - uptrend, pullback toward the 200 EMA.")
 alertcondition(snapShortSig, "Range snap short",     "EMA Rubber Band: price stretched ABOVE the 200 EMA in a range on {{ticker}} ({{interval}}). Check SNI/RSI for the snap back.")
 alertcondition(snapLongSig,  "Range snap long",      "EMA Rubber Band: price stretched BELOW the 200 EMA in a range on {{ticker}} ({{interval}}). Check SNI/RSI for the snap back.")
 alertcondition(failedSig,    "Commit failed",        "EMA Rubber Band: commit FAILED on {{ticker}} ({{interval}}) - back to range.")
