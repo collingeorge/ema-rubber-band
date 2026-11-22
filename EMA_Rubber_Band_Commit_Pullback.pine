@@ -2,7 +2,7 @@
 indicator("200 EMA Rubber Band: Range, Commit & First Pullback", shorttitle = "EMA Rubber Band", overlay = true, max_bars_back = 2000)
 
 // =============================================================================
-// 200 EMA Rubber Band: Range, Commit & First Pullback  (v4)
+// 200 EMA Rubber Band: Range, Commit & First Pullback  (v5)
 // -----------------------------------------------------------------------------
 // Models this behavior (gold, Nasdaq, oil, Nikkei; 5m for scalps, 1H for swings):
 //
@@ -92,6 +92,10 @@ ssDnSrc   = input.source(close, "SNI red dot (short) plot", group = grpSS, toolt
 ssUpSrc   = input.source(close, "SNI green dot (long) plot", group = grpSS, tooltip = "Pick the SNI output that draws the green dot. Left on 'close' = off.")
 ssSlope   = input.float(0.10, "EMA slope steeper than X", minval = 0.0, step = 0.01, group = grpSS, tooltip = "Compare with the dashboard's '200 EMA slope' value. 0.10 = the EMA moved at least 0.1x the normal stretch over the slope lookback.")
 ssBelow   = input.bool(false, "Shorts also need price below the EMA (longs above)", group = grpSS)
+ssNoCross = input.int(48, "Trend marks need no EMA cross in the last N bars (else = ranging)", minval = 0, group = grpSS)
+rsEnable  = input.bool(true, "Ranging: mark SMI dots only at a SNAP (band touch)", group = grpSS, tooltip = "Ranging = shaded range (enough EMA crosses) or EMA slope flatter than X. Red dot after a touch of the upper band = short, green dot after a touch of the lower band = long. Slope marks and TPB are off while ranging.")
+rsWin     = input.int(5, "Band touch may come up to N bars before the dot", minval = 0, group = grpSS)
+rsBlock   = input.bool(false, "Ranging dot marks also obey 'Block range fades against the highest HTF'", group = grpSS)
 
 // ---------------- Inputs: higher-timeframe filter ----------------
 grpHTF       = "Higher-timeframe filter"
@@ -292,8 +296,8 @@ bool twoDn      = v1 and b1 == -1 and v2 and b2 == -1
 bool twoUp      = v1 and b1 == 1 and v2 and b2 == 1
 bool htfDnOK    = tpHtfReq == "None" or (tpHtfReq == "First two HTFs" and twoDn) or (tpHtfReq == "Highest HTF" and topDn) or (tpHtfReq == "All three" and twoDn and topDn)
 bool htfUpOK    = tpHtfReq == "None" or (tpHtfReq == "First two HTFs" and twoUp) or (tpHtfReq == "Highest HTF" and topUp) or (tpHtfReq == "All three" and twoUp and topUp)
-bool tpDnAllowed = tpEnable and okData and emaFalling and htfDnOK and (state == 0 or state == -2)
-bool tpUpAllowed = tpEnable and okData and emaRising  and htfUpOK and (state == 0 or state == 2)
+bool tpDnAllowed = tpEnable and okData and emaFalling and htfDnOK and not wasRanging and (state == 0 or state == -2)
+bool tpUpAllowed = tpEnable and okData and emaRising  and htfUpOK and not wasRanging and (state == 0 or state == 2)
 
 var bool armDn  = false
 var bool zoneDn = false
@@ -344,8 +348,20 @@ bool dnDotRaw = f_dotOn(ssDnSrc)
 bool upDotRaw = f_dotOn(ssUpSrc)
 bool ssDnDot  = ssEnable and dnDotRaw
 bool ssUpDot  = ssEnable and upDotRaw
-bool ssShort  = okData and ssDnDot and not na(slopeN) and slopeN <= -ssSlope and (not ssBelow or close < ema200)
-bool ssLong   = okData and ssUpDot and not na(slopeN) and slopeN >= ssSlope  and (not ssBelow or close > ema200)
+// Ranging regime: shaded range (enough EMA crosses) or EMA flatter than the slope threshold
+bool crossedRecent = nz(ta.barssince(crossed), 100000) < ssNoCross
+bool rangingRegime = okData and (wasRanging or na(slopeN) or math.abs(slopeN) < ssSlope or crossedRecent)
+
+bool ssShort  = okData and ssDnDot and not rangingRegime and slopeN <= -ssSlope and (not ssBelow or close < ema200)
+bool ssLong   = okData and ssUpDot and not rangingRegime and slopeN >= ssSlope  and (not ssBelow or close > ema200)
+
+// Ranging: SMI dot only counts at a band touch (SNAP zone)
+bool touchUp  = okData and high >= ema200 + normDev
+bool touchDn  = okData and low <= ema200 - normDev
+bool nearTop  = nz(ta.barssince(touchUp), 100000) <= rsWin
+bool nearBot  = nz(ta.barssince(touchDn), 100000) <= rsWin
+bool rsShort  = rsEnable and rangingRegime and state == 0 and ssDnDot and nearTop and not (rsBlock and blockFades and topUp)
+bool rsLong   = rsEnable and rangingRegime and state == 0 and ssUpDot and nearBot and not (rsBlock and blockFades and topDn)
 
 // ---------------- Range snaps (rubber-band extremes) ----------------
 inRange   = okData and state == 0 and wasRanging
@@ -371,6 +387,8 @@ snapShortSig  = f_gate(snapUpOK and not snapUp[1] and confirmOK, cooldown)
 snapLongSig   = f_gate(snapDnOK and not snapDn[1] and confirmOK, cooldown)
 ssShortSig    = ssShort and confirmOK
 ssLongSig     = ssLong and confirmOK
+rsShortSig    = f_gate(rsShort and confirmOK, cooldown)
+rsLongSig     = f_gate(rsLong and confirmOK, cooldown)
 tpbShortSig   = f_gate(tpbShort and confirmOK, cooldown)
 tpbLongSig    = f_gate(tpbLong and confirmOK, cooldown)
 snapUpBlkSig  = snapUpBlk and not snapUp[1] and confirmOK
@@ -400,6 +418,12 @@ else if commitDn
 else if failed
     verdict := "Commit failed - back to range"
     vCol    := color.orange
+else if rsShort
+    verdict := "RANGE: SMI RED DOT AT UPPER BAND - short setup"
+    vCol    := color.fuchsia
+else if rsLong
+    verdict := "RANGE: SMI GREEN DOT AT LOWER BAND - long setup"
+    vCol    := color.aqua
 else if ssShort
     verdict := "SNI RED DOT + STEEP DOWN SLOPE - short setup"
     vCol    := color.red
@@ -477,6 +501,8 @@ plotshape(showMarks and laterLongSig,  "Later pullback long",   shape.triangleup
 plotshape(showMarks and laterShortSig, "Later pullback short",  shape.triangledown, location.abovebar, color.new(color.red, 40),  size = size.tiny, text = "PB", textcolor = color.new(color.red, 40))
 plotshape(showMarks and ssShortSig,    "SNI dot + slope short", shape.circle,       location.abovebar, color.red,     size = size.small, text = "SNI▼", textcolor = color.red)
 plotshape(showMarks and ssLongSig,     "SNI dot + slope long",  shape.circle,       location.belowbar, color.lime,    size = size.small, text = "SNI▲", textcolor = color.lime)
+plotshape(showMarks and rsShortSig,    "Range dot short",       shape.circle,       location.abovebar, color.fuchsia, size = size.small, text = "RNG▼", textcolor = color.fuchsia)
+plotshape(showMarks and rsLongSig,     "Range dot long",        shape.circle,       location.belowbar, color.aqua,    size = size.small, text = "RNG▲", textcolor = color.aqua)
 plotshape(showMarks and tpbShortSig,   "Trend pullback short",  shape.triangledown, location.abovebar, color.red,     size = size.normal, text = "TPB", textcolor = color.red)
 plotshape(showMarks and tpbLongSig,    "Trend pullback long",   shape.triangleup,   location.belowbar, color.lime,    size = size.normal, text = "TPB", textcolor = color.lime)
 plotshape(showMarks and snapShortSig,  "Range snap short",      shape.circle,       location.abovebar, color.fuchsia, size = size.tiny, text = "SNAP", textcolor = color.fuchsia)
@@ -531,6 +557,8 @@ alertcondition(pbLongSig,    "First pullback long",  "EMA Rubber Band: FIRST PUL
 alertcondition(pbShortSig,   "First pullback short", "EMA Rubber Band: FIRST PULLBACK SHORT at the 200 EMA on {{ticker}} ({{interval}}). Check SNI.")
 alertcondition(ssShortSig,   "SNI dot + slope short", "EMA Rubber Band: SNI RED DOT with steep falling 200 EMA on {{ticker}} ({{interval}}).")
 alertcondition(ssLongSig,    "SNI dot + slope long",  "EMA Rubber Band: SNI GREEN DOT with steep rising 200 EMA on {{ticker}} ({{interval}}).")
+alertcondition(rsShortSig,   "Range dot short",      "EMA Rubber Band: RANGE - SMI red dot at the upper band on {{ticker}} ({{interval}}).")
+alertcondition(rsLongSig,    "Range dot long",       "EMA Rubber Band: RANGE - SMI green dot at the lower band on {{ticker}} ({{interval}}).")
 alertcondition(tpbShortSig,  "Trend pullback short", "EMA Rubber Band: TREND PULLBACK SHORT on {{ticker}} ({{interval}}) - downtrend, pullback toward the 200 EMA.")
 alertcondition(tpbLongSig,   "Trend pullback long",  "EMA Rubber Band: TREND PULLBACK LONG on {{ticker}} ({{interval}}) - uptrend, pullback toward the 200 EMA.")
 alertcondition(snapShortSig, "Range snap short",     "EMA Rubber Band: price stretched ABOVE the 200 EMA in a range on {{ticker}} ({{interval}}). Check SNI/RSI for the snap back.")
