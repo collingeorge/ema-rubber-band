@@ -85,6 +85,14 @@ sniLevel   = input.float(50.0, "SNI overbought level (oversold = minus this)", s
 sniWin     = input.int(3, "SNI turn may come up to N bars before the zone", minval = 0, group = grpTP)
 showTpZone = input.bool(true, "Show pullback zone line", group = grpTP)
 
+// ---------------- Inputs: SNI dot + EMA slope (v4) ----------------
+grpSS     = "SNI dot + EMA slope"
+ssEnable  = input.bool(true, "Mark SNI dots when the EMA slope is steep", group = grpSS)
+ssDnSrc   = input.source(close, "SNI red dot (short) plot", group = grpSS, tooltip = "Pick the SNI output that draws the red dot. Left on 'close' = off.")
+ssUpSrc   = input.source(close, "SNI green dot (long) plot", group = grpSS, tooltip = "Pick the SNI output that draws the green dot. Left on 'close' = off.")
+ssSlope   = input.float(0.10, "EMA slope steeper than X", minval = 0.0, step = 0.01, group = grpSS, tooltip = "Compare with the dashboard's '200 EMA slope' value. 0.10 = the EMA moved at least 0.1x the normal stretch over the slope lookback.")
+ssBelow   = input.bool(false, "Shorts also need price below the EMA (longs above)", group = grpSS)
+
 // ---------------- Inputs: higher-timeframe filter ----------------
 grpHTF       = "Higher-timeframe filter"
 htfSlopeLen  = input.int(10, "HTF EMA slope lookback (HTF bars)", minval = 1, group = grpHTF)
@@ -326,6 +334,19 @@ if okData
             zoneUp  := false
             armUp   := false
 
+// ---------------- SNI dot + EMA slope (v4) ----------------
+// A dot counts on the bar where the chosen SNI output turns on (non-zero, not na).
+f_dotOn(float src) =>
+    bool on = not na(src) and src != 0 and src != close
+    on and not (not na(src[1]) and src[1] != 0 and src[1] != close[1])
+
+bool dnDotRaw = f_dotOn(ssDnSrc)
+bool upDotRaw = f_dotOn(ssUpSrc)
+bool ssDnDot  = ssEnable and dnDotRaw
+bool ssUpDot  = ssEnable and upDotRaw
+bool ssShort  = okData and ssDnDot and not na(slopeN) and slopeN <= -ssSlope and (not ssBelow or close < ema200)
+bool ssLong   = okData and ssUpDot and not na(slopeN) and slopeN >= ssSlope  and (not ssBelow or close > ema200)
+
 // ---------------- Range snaps (rubber-band extremes) ----------------
 inRange   = okData and state == 0 and wasRanging
 snapUp    = inRange and high >= ema200 + normDev and close <= ema200 + breakMult * normDev and not commitUp
@@ -348,8 +369,10 @@ laterLongSig  = laterLong and confirmOK
 laterShortSig = laterShort and confirmOK
 snapShortSig  = f_gate(snapUpOK and not snapUp[1] and confirmOK, cooldown)
 snapLongSig   = f_gate(snapDnOK and not snapDn[1] and confirmOK, cooldown)
-tpbShortSig   = tpbShort and confirmOK
-tpbLongSig    = tpbLong and confirmOK
+ssShortSig    = ssShort and confirmOK
+ssLongSig     = ssLong and confirmOK
+tpbShortSig   = f_gate(tpbShort and confirmOK, cooldown)
+tpbLongSig    = f_gate(tpbLong and confirmOK, cooldown)
 snapUpBlkSig  = snapUpBlk and not snapUp[1] and confirmOK
 snapDnBlkSig  = snapDnBlk and not snapDn[1] and confirmOK
 
@@ -377,6 +400,12 @@ else if commitDn
 else if failed
     verdict := "Commit failed - back to range"
     vCol    := color.orange
+else if ssShort
+    verdict := "SNI RED DOT + STEEP DOWN SLOPE - short setup"
+    vCol    := color.red
+else if ssLong
+    verdict := "SNI GREEN DOT + STEEP UP SLOPE - long setup"
+    vCol    := color.lime
 else if tpbShort
     verdict := "TREND PULLBACK SHORT" + (sniUse ? " - SNI turned down" : " - check SNI")
     vCol    := color.red
@@ -446,6 +475,8 @@ plotshape(showMarks and pbLongSig,     "First pullback long",   shape.triangleup
 plotshape(showMarks and pbShortSig,    "First pullback short",  shape.triangledown, location.abovebar, color.red,     size = size.normal, text = "PB1", textcolor = color.red)
 plotshape(showMarks and laterLongSig,  "Later pullback long",   shape.triangleup,   location.belowbar, color.new(color.lime, 40), size = size.tiny, text = "PB", textcolor = color.new(color.lime, 40))
 plotshape(showMarks and laterShortSig, "Later pullback short",  shape.triangledown, location.abovebar, color.new(color.red, 40),  size = size.tiny, text = "PB", textcolor = color.new(color.red, 40))
+plotshape(showMarks and ssShortSig,    "SNI dot + slope short", shape.circle,       location.abovebar, color.red,     size = size.small, text = "SNI▼", textcolor = color.red)
+plotshape(showMarks and ssLongSig,     "SNI dot + slope long",  shape.circle,       location.belowbar, color.lime,    size = size.small, text = "SNI▲", textcolor = color.lime)
 plotshape(showMarks and tpbShortSig,   "Trend pullback short",  shape.triangledown, location.abovebar, color.red,     size = size.normal, text = "TPB", textcolor = color.red)
 plotshape(showMarks and tpbLongSig,    "Trend pullback long",   shape.triangleup,   location.belowbar, color.lime,    size = size.normal, text = "TPB", textcolor = color.lime)
 plotshape(showMarks and snapShortSig,  "Range snap short",      shape.circle,       location.abovebar, color.fuchsia, size = size.tiny, text = "SNAP", textcolor = color.fuchsia)
@@ -498,6 +529,8 @@ alertcondition(commitUpSig,  "Commit up",            "EMA Rubber Band: COMMIT UP
 alertcondition(commitDnSig,  "Commit down",          "EMA Rubber Band: COMMIT DOWN on {{ticker}} ({{interval}}) - wait for first pullback to the 200 EMA.")
 alertcondition(pbLongSig,    "First pullback long",  "EMA Rubber Band: FIRST PULLBACK LONG at the 200 EMA on {{ticker}} ({{interval}}). Check SNI.")
 alertcondition(pbShortSig,   "First pullback short", "EMA Rubber Band: FIRST PULLBACK SHORT at the 200 EMA on {{ticker}} ({{interval}}). Check SNI.")
+alertcondition(ssShortSig,   "SNI dot + slope short", "EMA Rubber Band: SNI RED DOT with steep falling 200 EMA on {{ticker}} ({{interval}}).")
+alertcondition(ssLongSig,    "SNI dot + slope long",  "EMA Rubber Band: SNI GREEN DOT with steep rising 200 EMA on {{ticker}} ({{interval}}).")
 alertcondition(tpbShortSig,  "Trend pullback short", "EMA Rubber Band: TREND PULLBACK SHORT on {{ticker}} ({{interval}}) - downtrend, pullback toward the 200 EMA.")
 alertcondition(tpbLongSig,   "Trend pullback long",  "EMA Rubber Band: TREND PULLBACK LONG on {{ticker}} ({{interval}}) - uptrend, pullback toward the 200 EMA.")
 alertcondition(snapShortSig, "Range snap short",     "EMA Rubber Band: price stretched ABOVE the 200 EMA in a range on {{ticker}} ({{interval}}). Check SNI/RSI for the snap back.")
